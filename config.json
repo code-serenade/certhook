@@ -1,0 +1,9 @@
+{
+    "*": {
+        "user": "root",
+        "privateKey": "-----BEGIN RSA PRIVATE KEY-----\nxxxxxxx\n-----END RSA PRIVATE KEY-----",
+        "port": "22",
+        "certPath": "/data/cert",
+        "token": "token"
+    }
+}
