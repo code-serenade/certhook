@@ -1,6 +1,6 @@
 # 证书部署 Webhook 服务
 ## 一、简介
-本项目是一个使用 Go 语言和 Gin 框架实现的证书部署 Webhook 服务。当接收到特定的证书部署请求时，该服务能够解析请求中的数据，获取域名对应的 IP 地址，并通过 SSH 将证书和密钥发送到指定 IP 的服务器上，并重新加载 Nginx 服务。
+本项目是一个使用 Go 语言和 Gin 框架实现的证书部署 Webhook 服务。当接收到特定的证书部署请求时，该服务能够解析请求中的数据，获取域名对应的 IP 地址，并通过 SSH 将证书和密钥发送到指定 IP 的服务器上，并重新加载 Nginx 服务。目前支持OHTTPS(https://ohttps.com)
 ## 二、功能特点
 ### 1. 证书部署处理
 接收包含证书信息的 Webhook 请求，包括证书名称、关联域名、私钥、完整证书链和过期时间等。
@@ -17,9 +17,10 @@
     "ip_address_1": {
         "user": "ssh_username_1",
         "privateKey": "ssh_private_key_1",
-        "port": "ssh_port_1",
+        "port": "",
         "certPath": "certificate_path_1",
-        "token": "token_1"
+        "token": "token_1",
+        "ips": [{"ip": "ip_address_1", "port": "port_1"}, {"ip": "ip_address_2", "port": "port_2"}]
     },
     "ip_address_2": {
         "user": "ssh_username_2",
@@ -38,7 +39,7 @@
     }
 }
 ```
-其中，ip_address_n为具体的 IP 地址或域名，每个配置项包含 SSH 连接所需的用户、私钥、端口、证书存储路径和用于签名验证的令牌。通配符配置项*用于在无法找到特定 IP 或域名的配置时提供默认值。
+其中，ip_address_n为具体的 IP 地址或域名，每个配置项包含 SSH 连接所需的用户、私钥、端口(或用ips配置)、证书存储路径和用于签名验证的令牌。通配符配置项*用于在无法找到特定 IP 或域名的配置时提供默认值。
 ### 2. 启动服务
 运行以下命令启动服务：
 ```
