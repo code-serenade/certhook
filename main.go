@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/ssh"
@@ -28,11 +29,17 @@ type RequestData struct {
 }
 
 type SSHConfig struct {
-	User       string `json:"user"`
-	PrivateKey string `json:"privateKey"`
-	Port       string `json:"port"`
-	CertPath   string `json:"certPath"`
-	Token      string `json:"token"`
+	User       string   `json:"user"`
+	PrivateKey string   `json:"privateKey"`
+	Port       string   `json:"port"`
+	CertPath   string   `json:"certPath"`
+	Token      string   `json:"token"`
+	IPS        []IPInfo `json:"ips"`
+}
+
+type IPInfo struct {
+	IP   string `json:"ip"`
+	Port string `json:"port"`
 }
 
 var Config map[string]SSHConfig
@@ -48,30 +55,50 @@ func handleWebhook(c *gin.Context) {
 		return
 	}
 	log.Printf("Received data: %+v", data)
-	// 获取域名对应的 IP 地址
+	unknown := false
 	for _, domain := range data.Payload.CertificateDomains {
 		oldDomain := domain
-		token := Config[domain].Token
+		sshConfig := Config[domain]
+		token := sshConfig.Token
 		if len(token) < 1 {
-			token = Config["*"].Token
+			sshConfig = Config["*"]
+			token = sshConfig.Token
 		}
 		expectedSign := generateSign(data.Timestamp, token)
 		if data.Sign != expectedSign {
 			c.JSON(401, gin.H{"error": "Invalid signature"})
 			return
 		}
-		if strings.Contains(domain, "*") {
-			domain = strings.ReplaceAll(domain, "*", "ip")
+		if len(sshConfig.IPS) > 0 {
+			err := sendCertAndReloadNginx("", oldDomain, data.Payload.CertificateCertKey, data.Payload.CertificateFullchainCerts)
+			if err != nil {
+				c.JSON(401, gin.H{"error": err.Error()})
+				return
+			}
+		} else {
+			if strings.Contains(domain, "*") {
+				domain = strings.ReplaceAll(domain, "*", "ip")
+			}
+			ips, err := net.LookupIP(domain)
+			if err != nil {
+				log.Printf("Error looking up IP for domain %s: %v", domain, err)
+				unknown = true
+				break
+			}
+			for _, ip := range ips {
+				log.Printf("Domain %s has IP %s", oldDomain, ip)
+				err = sendCertAndReloadNginx(ip.String(), oldDomain, data.Payload.CertificateCertKey, data.Payload.CertificateFullchainCerts)
+				if err != nil {
+					c.JSON(401, gin.H{"error": err.Error()})
+					return
+				}
+			}
 		}
-		ips, err := net.LookupIP(domain)
-		if err != nil {
-			log.Printf("Error looking up IP for domain %s: %v", domain, err)
-			continue
-		}
-		for _, ip := range ips {
-			log.Printf("Domain %s has IP %s", oldDomain, ip)
-			sendCertAndReloadNginx(ip.String(), oldDomain, data.Payload.CertificateCertKey, data.Payload.CertificateFullchainCerts)
-		}
+
+	}
+	if unknown {
+		c.JSON(401, gin.H{"error": "Unknown domain"})
+		return
 	}
 	c.JSON(200, gin.H{"success": true})
 }
@@ -82,7 +109,7 @@ func generateSign(timestamp int64, callbackToken string) string {
 	return hex.EncodeToString(hash[:])
 }
 
-func sendCertAndReloadNginx(ip, domain, certKey, fullchainCerts string) {
+func sendCertAndReloadNginx(ip, domain, certKey, fullchainCerts string) (err error) {
 	sshConfig := Config[ip]
 	if len(sshConfig.User) < 1 {
 		sshConfig = Config[domain]
@@ -90,9 +117,28 @@ func sendCertAndReloadNginx(ip, domain, certKey, fullchainCerts string) {
 	if len(sshConfig.User) < 1 {
 		sshConfig = Config["*"]
 	}
+	if len(sshConfig.IPS) > 0 {
+		for _, ipInfo := range sshConfig.IPS {
+			err = sendCertAndReloadNginxSingle(ipInfo.IP, ipInfo.Port, domain, certKey, fullchainCerts, sshConfig)
+			if err != nil {
+				return
+			}
+		}
+	} else {
+		err = sendCertAndReloadNginxSingle(ip, sshConfig.Port, domain, certKey, fullchainCerts, sshConfig)
+		if err != nil {
+			return
+		}
+	}
+
+	return
+}
+
+func sendCertAndReloadNginxSingle(ip, port, domain, certKey, fullchainCerts string, sshConfig SSHConfig) (err error) {
 	signer, err := ssh.ParsePrivateKey([]byte(sshConfig.PrivateKey))
 	if err != nil {
-		log.Fatalf("Failed to parse private key: %v err: %v", sshConfig.PrivateKey, err)
+		log.Printf("Failed to parse private key: %v err: %v\n", sshConfig.PrivateKey, err)
+		return
 	}
 	config := &ssh.ClientConfig{
 		User: sshConfig.User,
@@ -100,17 +146,20 @@ func sendCertAndReloadNginx(ip, domain, certKey, fullchainCerts string) {
 			ssh.PublicKeys(signer),
 		},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         time.Second * 10,
 	}
 
-	client, err := ssh.Dial("tcp", ip+":"+sshConfig.Port, config)
+	client, err := ssh.Dial("tcp", ip+":"+port, config)
 	if err != nil {
-		log.Fatalf("Failed to dial: %v", err)
+		log.Printf("Failed to dial: %v\n", err)
+		return
 	}
 	defer client.Close()
 
 	err = sshRun(client, "mkdir -p "+sshConfig.CertPath)
 	if err != nil {
-		log.Fatalf("Failed to mkdir certPath: %v", err)
+		log.Printf("Failed to mkdir certPath: %v\n", err)
+		return
 	}
 
 	var certContent bytes.Buffer
@@ -118,7 +167,8 @@ func sendCertAndReloadNginx(ip, domain, certKey, fullchainCerts string) {
 
 	err = sshRun(client, fmt.Sprintf("cat > %s <<EOF\n%s\nEOF", sshConfig.CertPath+"/"+domain+".pem", certContent.String()))
 	if err != nil {
-		log.Fatalf("Failed to send cert: %v", err)
+		log.Printf("Failed to send cert: %v\n", err)
+		return
 	}
 
 	var keyContent bytes.Buffer
@@ -126,26 +176,42 @@ func sendCertAndReloadNginx(ip, domain, certKey, fullchainCerts string) {
 
 	err = sshRun(client, fmt.Sprintf("cat > %s <<EOF\n%s\nEOF", sshConfig.CertPath+"/"+domain+".key", keyContent.String()))
 	if err != nil {
-		log.Fatalf("Failed to send key: %v", err)
+		log.Printf("Failed to send key: %v\n", err)
+		return
+	}
+
+	err = sshRun(client, "nginx -t")
+	if err != nil {
+		log.Printf("Failed to nginx -t: %v\n", err)
+		return
 	}
 
 	err = sshRun(client, "systemctl reload nginx")
 	if err != nil {
-		log.Fatalf("Failed to reload nginx: %v", err)
+		log.Printf("Failed to reload nginx: %v\n", err)
+		return
 	}
 
-	log.Printf("Successfully sent cert and key to %s and reloaded nginx.", ip)
+	log.Printf("Successfully sent cert and key to %s and reloaded nginx.\n", ip)
+	return
 }
 
-func sshRun(client *ssh.Client, command string) error {
+func sshRun(client *ssh.Client, command string) (err error) {
 	session, err := client.NewSession()
 	if err != nil {
-		return err
+		return
 	}
 	defer session.Close()
-	session.Stdout = os.Stdout
-	session.Stderr = os.Stderr
-	return session.Run(command)
+	var stdout, stderr bytes.Buffer
+	session.Stdout = &stdout
+	session.Stderr = &stderr
+	err = session.Run(command)
+	if err != nil {
+		log.Printf("Command '%s' failed with error: %v\nStderr: %s", command, err, stderr.String())
+	} else {
+		log.Printf("Command '%s' executed successfully.\nStdout: %s", command, stdout.String())
+	}
+	return
 }
 
 func initConfig() {
